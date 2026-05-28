@@ -5,7 +5,7 @@ import MLXAudioCore
 @preconcurrency import AVFoundation
 #endif
 
-public protocol SpeechGenerationModel: AnyObject {
+public protocol SpeechGenerationModel: AnyObject, Sendable {
     var sampleRate: Int { get }
     var defaultGenerationParameters: GenerateParameters { get }
 

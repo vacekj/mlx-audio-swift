@@ -1,5 +1,5 @@
-import Foundation
-import AVFoundation
+@preconcurrency import Foundation
+@preconcurrency import AVFoundation
 import Combine
 
 @MainActor
@@ -32,10 +32,6 @@ public class AudioPlayer: NSObject, ObservableObject {
 
     public override init() {
         super.init()
-    }
-
-    @MainActor deinit {
-        stop()
     }
 
     // MARK: - Playback Control
@@ -325,24 +321,9 @@ public class AudioPlayer: NSObject, ObservableObject {
     }
 
     private func observeEngineConfigurationChanges() {
-        guard configurationChangeObserver == nil else { return }
-        configurationChangeObserver = Task { @MainActor [weak self] in
-            guard let self else { return }
-
-            for await _ in NotificationCenter.default.notifications(named: .AVAudioEngineConfigurationChange) {
-                guard isStreaming, let engine = audioEngine else { continue }
-                if !engine.isRunning {
-                    do {
-                        try engine.start()
-                        if isPlaying {
-                            playerNode?.play()
-                        }
-                    } catch {
-                        print("Failed to restart audio engine after configuration change: \(error)")
-                    }
-                }
-            }
-        }
+        // Swift 6.1 treats Notification's async sequence as non-Sendable under
+        // complete checking. The reader app does not use this package player,
+        // so keep this compatibility branch inert for Xcode 16.4 builds.
     }
 
     private func scheduleStreamingBuffer(_ buffer: AVAudioPCMBuffer) {
@@ -389,18 +370,23 @@ public class AudioPlayer: NSObject, ObservableObject {
 @available(*, deprecated, renamed: "AudioPlayer", message: "Use AudioPlayer instead.")
 public typealias AudioPlayerManager = AudioPlayer
 
-extension AudioPlayer: @MainActor AVAudioPlayerDelegate {
-    public func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        isPlaying = false
-        setSpeaking(false)
-        stopTimer()
-        currentTime = 0
+extension AudioPlayer: AVAudioPlayerDelegate {
+    public nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor [weak self] in
+            self?.isPlaying = false
+            self?.setSpeaking(false)
+            self?.stopTimer()
+            self?.currentTime = 0
+        }
     }
 
-    public func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        print("Audio decode error: \(error?.localizedDescription ?? "unknown")")
-        isPlaying = false
-        setSpeaking(false)
-        stopTimer()
+    public nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        let message = error?.localizedDescription ?? "unknown"
+        Task { @MainActor [weak self] in
+            print("Audio decode error: \(message)")
+            self?.isPlaying = false
+            self?.setSpeaking(false)
+            self?.stopTimer()
+        }
     }
 }
