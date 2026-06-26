@@ -194,6 +194,13 @@ public enum TTS {
                 pretrained: { try await KokoroModel.fromPretrained($0, textProcessor: processor, cache: $1) },
                 local: { modelDir, _ in try await KokoroModel.fromModelDirectory(modelDir, textProcessor: processor) }
             )
+        case "higgs", "higgs_audio_v3", "higgs_multimodal_qwen3", "higgs_tts":
+            return try await load(
+                source,
+                modelType: resolvedType,
+                pretrained: { try await HiggsAudioModel.fromPretrained($0, cache: $1) },
+                local: { modelDir, _ in try await HiggsAudioModel.fromModelDirectory(modelDir) }
+            )
         default:
             throw TTSModelError.unsupportedModelType(resolvedType)
         }
@@ -252,6 +259,9 @@ public enum TTS {
 
     private static func inferModelType(from modelRepo: String) -> String? {
         let lower = modelRepo.lowercased()
+        if lower.contains("higgs") {
+            return "higgs"
+        }
         if lower.contains("qwen3_tts") {
             return "qwen3_tts"
         }
@@ -284,7 +294,7 @@ public enum TTS {
         if lower.contains("llama") || lower.contains("orpheus") {
             return "llama_tts"
         }
-        if lower.contains("csm") || lower.contains("sesame") {
+        if lower.contains("csm") || lower.contains("sesame") || lower.contains("misotts") || lower.contains("miso") {
             return "csm"
         }
         if lower.contains("pocket_tts") {
