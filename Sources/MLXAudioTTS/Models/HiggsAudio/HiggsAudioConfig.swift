@@ -41,6 +41,15 @@ public struct HiggsAudioConfig: Sendable {
     public var useDelayPattern: Bool = true
     public var sampleRate: Int = 24_000
 
+    // MARK: Encode path (voice cloning)
+
+    /// Sample rate the bundled HuBERT/Wav2Vec2 semantic model runs at.
+    public var semanticSampleRate: Int = 16_000
+    /// HuBERT feature-extractor stride product (16 kHz raw -> 50 Hz frames).
+    public var downsampleFactor: Int = 320
+    /// Stride-slice factor aligning HuBERT frames (50 Hz) to acoustic frames (25 Hz).
+    public var semanticDownsampleFactor: Int = 2
+
     public init() {}
 
     /// Parse the Hugging Face ``config.json`` layout produced by Boson AI.

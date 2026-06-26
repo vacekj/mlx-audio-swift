@@ -38,6 +38,32 @@ func higgsReverseDelayPattern(_ delayed: MLXArray) -> MLXArray {
     return MLX.concatenated(cols, axis: 1)
 }
 
+/// Forward delay pattern: raw codec codes ``[T, N]`` -> delayed rows
+/// ``[T + N - 1, N]``. Codebook ``c`` is shifted down by ``c`` rows: the head is
+/// filled with the BOC token (``c`` rows), the raw codes occupy rows
+/// ``[c, c+T)``, and the tail is filled with the EOC token. This is the layout
+/// the reference-audio codes must take before being embedded into the prompt.
+func higgsApplyDelayPattern(_ codes: MLXArray, bocId: Int, eocId: Int) -> MLXArray {
+    let t = codes.dim(0)
+    let n = codes.dim(1)
+    let length = t + n - 1
+    var cols: [MLXArray] = []
+    for c in 0..<n {
+        let raw = codes[0..<t, c..<(c + 1)] // [T, 1]
+        var pieces: [MLXArray] = []
+        if c > 0 {
+            pieces.append(MLXArray.full([c, 1], values: MLXArray(Int32(bocId))))
+        }
+        pieces.append(raw)
+        let tail = length - (c + t)
+        if tail > 0 {
+            pieces.append(MLXArray.full([tail, 1], values: MLXArray(Int32(eocId))))
+        }
+        cols.append(MLX.concatenated(pieces, axis: 0))
+    }
+    return MLX.concatenated(cols, axis: 1)
+}
+
 /// Top-k masking: keep the ``topK`` highest-probability tokens, mask the rest
 /// with ``-inf``.
 private func higgsApplyTopK(_ logits: MLXArray, topK: Int) -> MLXArray {

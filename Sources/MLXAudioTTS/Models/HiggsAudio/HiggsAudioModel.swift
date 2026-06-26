@@ -158,9 +158,10 @@ final class HiggsBackbone: Module {
 // MARK: - Model
 
 public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Sendable {
-    /// Fixed RNG seed for every Higgs generation so the zero-shot voice stays
-    /// consistent across chunks of one reading (see ``generateSamples``).
-    static let generationSeed: UInt64 = 42
+    /// RNG seed for Higgs generation. Set per request so the zero-shot voice
+    /// stays consistent across chunks of one reading, while letting the app
+    /// pick/randomize/save a specific voice timbre (see ``generateSamples``).
+    public var generationSeed: UInt64 = 42
 
     let configuration: HiggsAudioConfig
 
@@ -184,7 +185,7 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
             embeddingCount: config.numCodebooks * config.codebookSize,
             dimensions: config.text.hiddenSize
         )
-        self.codec = HiggsAudioCodec()
+        self.codec = HiggsAudioCodec(config)
     }
 
     // MARK: SpeechGenerationModel
@@ -207,7 +208,9 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
             text: text,
             temperature: generationParameters.temperature,
             topK: generationParameters.topK > 0 ? generationParameters.topK : nil,
-            maxTokens: generationParameters.maxTokens ?? 2048
+            maxTokens: generationParameters.maxTokens ?? 2048,
+            refAudio: refAudio,
+            refText: refText
         )
         return MLXArray(samples)
     }
@@ -227,7 +230,10 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
         let task = Task { @Sendable [weak self, continuation] in
             guard let self else { return }
             do {
-                let samples = try await self.generateSamples(text: text, temperature: temp, topK: topK, maxTokens: maxTokens)
+                let samples = try await self.generateSamples(
+                    text: text, temperature: temp, topK: topK, maxTokens: maxTokens,
+                    refAudio: refAudio, refText: refText
+                )
                 continuation.yield(.audio(MLXArray(samples)))
                 continuation.finish()
             } catch {
@@ -262,19 +268,100 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
         return flat.reshaped(leading + [configuration.numCodebooks, v])
     }
 
-    /// Build the prompt embedding sequence ``[1, L, hidden]`` for ``text``.
-    /// Zero-shot only (no reference codes).
-    private func buildPromptEmbeddings(text: String) -> MLXArray {
-        var ids: [Int] = [ttsTokenId, textTokenId]
+    /// A reference-audio turn: delayed codes ``[L, N]`` plus an optional
+    /// transcript, spliced into the prompt ahead of the main ``<|text|>`` turn.
+    private struct HiggsReference {
+        let delayedCodes: MLXArray
+        let text: String?
+    }
+
+    /// Encoded reference codes memoized by the source MLXArray identity, so the
+    /// same reference clip is encoded once and reused across all chunks of a
+    /// reading (mirrors the Qwen3-TTS caching strategy).
+    private var referenceCodesCache: [ObjectIdentifier: MLXArray] = [:]
+
+    /// Encode a reference waveform into delay-patterned Higgs codes
+    /// ``[T + N - 1, N]``. ``refAudio`` is a 1-D waveform at 24 kHz.
+    private func encodeReference(_ refAudio: MLXArray) -> MLXArray {
+        if let cached = referenceCodesCache[ObjectIdentifier(refAudio)] {
+            return cached
+        }
+        var wav = refAudio.asArray(Float.self)
+        if wav.count < configuration.sampleRate {
+            wav += [Float](repeating: 0, count: configuration.sampleRate - wav.count)
+        }
+        let waveform = MLXArray(wav).reshaped([1, -1, 1]).asType(.float32) // [1, T, 1]
+        let codes = codec.encode(waveform)[0].asType(.int32) // [T', 8]
+        eval(codes)
+        let delayed = higgsApplyDelayPattern(
+            codes,
+            bocId: configuration.bocTokenId,
+            eocId: configuration.eocTokenId
+        ) // [T' + N - 1, 8]
+        eval(delayed)
+        referenceCodesCache[ObjectIdentifier(refAudio)] = delayed
+        return delayed
+    }
+
+    /// Build the prompt embedding sequence ``[1, L, hidden]`` for ``text``,
+    /// optionally preceded by one or more reference turns. Layout mirrors the
+    /// Python ``HiggsAudioV3PromptBuilder.build_prompt`` + ``_build_prompt_embeddings``:
+    /// ``<|tts|>`` then, per reference, ``[<|ref_text|> refText]? <|ref_audio|>``
+    /// followed by the delayed reference codes, then ``<|text|>`` + text + ``<|audio|>``.
+    private func buildPromptEmbeddings(text: String, references: [HiggsReference]) -> MLXArray {
+        let placeholder = configuration.audioTokenId // -100
+        var ids: [Int] = [ttsTokenId]
+        var segments: [(start: Int, codes: MLXArray)] = []
+
+        for ref in references {
+            if let rid = refTextTokenId, let refText = ref.text, !refText.isEmpty {
+                ids.append(rid)
+                ids.append(contentsOf: tokenizer!.encode(text: refText, addSpecialTokens: false))
+            }
+            ids.append(refAudioTokenId)
+            let start = ids.count
+            let numRows = ref.delayedCodes.dim(0)
+            ids.append(contentsOf: Array(repeating: placeholder, count: numRows))
+            segments.append((start, ref.delayedCodes))
+        }
+
+        ids.append(textTokenId)
         ids.append(contentsOf: tokenizer!.encode(text: text, addSpecialTokens: false))
         ids.append(audioTokenId)
-        let embeds = backbone.embedTokenIds(ids) // [L, hidden]
-        return embeds.expandedDimensions(axis: 0) // [1, L, hidden]
+
+        // Walk the id list, emitting text-token embeddings between audio segments
+        // and fused multi-codebook embeddings for the reference code spans. The
+        // -100 placeholders are never embedded: they only mark the code span.
+        var pieces: [MLXArray] = []
+        var cursor = 0
+        for (start, codes) in segments {
+            if start > cursor {
+                pieces.append(backbone.embedTokenIds(Array(ids[cursor..<start])))
+            }
+            pieces.append(embedAudioCodes(codes))
+            cursor = start + codes.dim(0)
+        }
+        if cursor < ids.count {
+            pieces.append(backbone.embedTokenIds(Array(ids[cursor..<ids.count])))
+        }
+
+        let nonEmpty = pieces.filter { $0.dim(0) > 0 }
+        let full = MLX.concatenated(nonEmpty, axis: 0) // [L, hidden]
+        return full.expandedDimensions(axis: 0) // [1, L, hidden]
+    }
+
+    /// Codec round-trip for validation: encode a reference waveform to codes,
+    /// then decode it back to a waveform. Used to verify the encode path is
+    /// faithful (decode is already exercised by zero-shot synthesis).
+    public func reconstructReference(_ refAudio: MLXArray) -> MLXArray {
+        let delayed = encodeReference(refAudio) // [L, N]
+        let raw = higgsReverseDelayPattern(delayed) // [T, N]
+        return codec.decode(raw) // [T*960]
     }
 
     // MARK: - Generation core
 
-    private func generateSamples(text: String, temperature: Float, topK: Int?, maxTokens: Int) async throws -> [Float] {
+    private func generateSamples(text: String, temperature: Float, topK: Int?, maxTokens: Int, refAudio: MLXArray?, refText: String?) async throws -> [Float] {
         guard tokenizer != nil else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
         }
@@ -282,9 +369,13 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
         // Fix the RNG seed per chunk so every chunk of a generation draws from
         // the same random state — otherwise zero-shot Higgs drifts to a
         // different voice/timbre between chunks. Same text+seed is reproducible.
-        MLXRandom.seed(HiggsAudioModel.generationSeed)
+        MLXRandom.seed(generationSeed)
 
-        let promptEmbeds = buildPromptEmbeddings(text: text)
+        var references: [HiggsReference] = []
+        if let refAudio {
+            references.append(HiggsReference(delayedCodes: encodeReference(refAudio), text: refText))
+        }
+        let promptEmbeds = buildPromptEmbeddings(text: text, references: references)
         eval(promptEmbeds)
 
         let cache: [KVCache] = (0..<configuration.text.hiddenLayers).map { _ in KVCacheSimple() }
