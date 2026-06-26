@@ -28,6 +28,8 @@ public final class MarvisTTSModel: Module {
     private let _textTokenizer: Tokenizers.Tokenizer
     private let _audio_tokenizer: MimiTokenizer
     private let _streamingDecoder: MimiStreamingDecoder
+    private let _speakerPrefixSpace: Bool
+    private let _supportsTextOnlyGeneration: Bool
     
     public init(
         config: CSMModelArgs,
@@ -39,6 +41,8 @@ public final class MarvisTTSModel: Module {
         _ = repoId
         self.model = CSMModel(config: config)
         self._promptURLs = promptURLs
+        self._speakerPrefixSpace = config.speakerPrefixSpace
+        self._supportsTextOnlyGeneration = config.modelType == "sesame"
         self._textTokenizer = textTokenizer
         self._audio_tokenizer = audioTokenizer
         self._streamingDecoder = MimiStreamingDecoder(audioTokenizer.codec)
@@ -71,7 +75,8 @@ public final class MarvisTTSModel: Module {
         let K = model.args.audioNumCodebooks
         let frameW = K + 1
         
-        let prompt = "[\(speaker)]" + text
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = _speakerPrefixSpace ? "[\(speaker)] \(trimmed)" : "[\(speaker)]\(trimmed)"
         let ids = MLXArray(_textTokenizer.encode(text: prompt))
         
         let T = ids.shape[0]
@@ -179,7 +184,11 @@ public extension MarvisTTSModel {
         let configFileURL = modelDirectoryURL.appendingPathComponent("config.json")
         let args = try JSONDecoder().decode(CSMModelArgs.self, from: Data(contentsOf: configFileURL))
 
-        let textTokenizer = try await AutoTokenizer.from(modelFolder: modelDirectoryURL)
+        let textTokenizer = try await marvisResolveTextTokenizer(
+            modelDirectoryURL: modelDirectoryURL,
+            args: args,
+            modelRepo: modelRepo
+        )
         let codec = try await Mimi.fromPretrained(cache: cache, progressHandler: progressHandler)
         let audioTokenizer = MimiTokenizer(codec)
         let model = MarvisTTSModel(
@@ -263,6 +272,30 @@ public extension MarvisTTSModel {
 }
 
 // MARK: - Loading Helpers
+
+private func marvisModelFolderHasTokenizer(_ directory: URL) -> Bool {
+    let tokenizerFiles = ["tokenizer.json", "tokenizer_config.json"]
+    return tokenizerFiles.contains {
+        FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+    }
+}
+
+private func marvisResolveTextTokenizer(
+    modelDirectoryURL: URL,
+    args: CSMModelArgs,
+    modelRepo: String
+) async throws -> Tokenizers.Tokenizer {
+    if marvisModelFolderHasTokenizer(modelDirectoryURL) {
+        return try await AutoTokenizer.from(modelFolder: modelDirectoryURL)
+    }
+
+    if args.modelType == "sesame" || modelRepo.localizedCaseInsensitiveContains("miso") {
+        // Miso TTS uses the Llama 3.2 tokenizer but does not ship tokenizer files in the MLX repo.
+        return try await AutoTokenizer.from(pretrained: "meta-llama/Llama-3.2-1B")
+    }
+
+    return try await AutoTokenizer.from(modelFolder: modelDirectoryURL)
+}
 
 private func marvisLoadWeights(from directory: URL) throws -> [String: MLXArray] {
     let fileManager = FileManager.default
@@ -369,11 +402,11 @@ public extension MarvisTTSModel {
         let task = Task { @Sendable [weak self, continuation] in
             guard let self else { return }
             do {
-                guard voice != nil || refAudio != nil else {
+                guard voice != nil || refAudio != nil || self._supportsTextOnlyGeneration else {
                     throw MarvisTTSModelError.invalidArgument("`voice` or `refAudio`/`refText` must be specified.")
                 }
                 
-                let context: Segment
+                let context: Segment?
                 if let refAudio, let refText {
                     context = Segment(speaker: 0, text: refText, audio: refAudio)
                 } else if let voice {
@@ -395,6 +428,8 @@ public extension MarvisTTSModel {
                     
                     let (_, refAudio) = try loadAudioArray(from: refAudioURL)
                     context = Segment(speaker: 0, text: refText, audio: refAudio)
+                } else if self._supportsTextOnlyGeneration {
+                    context = nil
                 } else {
                     throw MarvisTTSModelError.voiceNotFound
                 }
@@ -406,13 +441,17 @@ public extension MarvisTTSModel {
                 for prompt in text {
                     if Task.isCancelled { break outerLoop }
                     
-                    let generationText = (context.text + " " + prompt).trimmingCharacters(in: .whitespaces)
-                    let seg = Segment(speaker: 0, text: generationText, audio: context.audio)
-                    
                     model.resetCaches()
                     _streamingDecoder.reset()
                     
-                    let (toks, masks) = try tokenizeSegment(seg, addEOS: false)
+                    let (toks, masks): (MLXArray, MLXArray)
+                    if let context {
+                        let generationText = (context.text + " " + prompt).trimmingCharacters(in: .whitespaces)
+                        let seg = Segment(speaker: 0, text: generationText, audio: context.audio)
+                        (toks, masks) = try tokenizeSegment(seg, addEOS: false)
+                    } else {
+                        (toks, masks) = tokenizeTextSegment(text: prompt, speaker: 0)
+                    }
                     let promptTokens = toks.asType(Int32.self) // [T, K+1]
                     let promptMask = masks.asType(Bool.self) // [T, K+1]
                     
@@ -561,7 +600,7 @@ extension MarvisTTSModel: SpeechGenerationModel, @unchecked Sendable {
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
         _ = generationParameters
-        let resolvedVoice = try resolveVoice(from: voice)
+        let resolvedVoice = try resolveVoice(from: voice, refAudio: refAudio)
 
         let audio = try await generate(
             text: [text],
@@ -610,7 +649,7 @@ extension MarvisTTSModel: SpeechGenerationModel, @unchecked Sendable {
 
             do {
                 _ = generationParameters
-                let resolvedVoice = try resolveVoice(from: voice)
+                let resolvedVoice = try resolveVoice(from: voice, refAudio: refAudio)
 
                 for try await chunk in generate(
                     text: text,
@@ -635,17 +674,20 @@ extension MarvisTTSModel: SpeechGenerationModel, @unchecked Sendable {
 }
 
 private extension MarvisTTSModel {
-    func resolveVoice(from voice: String?) throws -> Voice {
-        guard let voice, !voice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+    func resolveVoice(from voice: String?, refAudio: MLXArray?) throws -> Voice? {
+        if let voice, !voice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let normalized = voice.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let resolved = Voice(rawValue: normalized) else {
+                throw AudioGenerationError.invalidInput("Unknown Marvis voice: \(voice)")
+            }
+            return resolved
+        }
+
+        if refAudio != nil || !_supportsTextOnlyGeneration {
             return .conversationalA
         }
 
-        let normalized = voice.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let resolved = Voice(rawValue: normalized) else {
-            throw AudioGenerationError.invalidInput("Unknown Marvis voice: \(voice)")
-        }
-
-        return resolved
+        return nil
     }
 }
 

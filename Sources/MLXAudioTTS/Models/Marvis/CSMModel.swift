@@ -166,6 +166,7 @@ public struct CSMModelArgs: Codable, Sendable {
     public let useCache: Bool
     public let vocabSize: Int
     public let quantization: [String: MarvisJSONValue]?
+    public let speakerPrefixSpace: Bool
 
     public init(
         modelType: String,
@@ -202,6 +203,7 @@ public struct CSMModelArgs: Codable, Sendable {
         useCache: Bool,
         vocabSize: Int,
         quantization: [String: MarvisJSONValue]?,
+        speakerPrefixSpace: Bool = false,
     ) {
         self.modelType = modelType
         self.backboneFlavor = backboneFlavor
@@ -237,6 +239,48 @@ public struct CSMModelArgs: Codable, Sendable {
         self.useCache = useCache
         self.vocabSize = vocabSize
         self.quantization = quantization
+        self.speakerPrefixSpace = speakerPrefixSpace
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "csm"
+        backboneFlavor = try container.decode(String.self, forKey: .backboneFlavor)
+        decoderFlavor = try container.decode(String.self, forKey: .decoderFlavor)
+        textVocabSize = try container.decode(Int.self, forKey: .textVocabSize)
+        audioVocabSize = try container.decode(Int.self, forKey: .audioVocabSize)
+        audioNumCodebooks = try container.decode(Int.self, forKey: .audioNumCodebooks)
+        depthDecoderConfig = try container.decodeIfPresent(DepthDecoderConfig.self, forKey: .depthDecoderConfig)
+        quantization = try container.decodeIfPresent([String: MarvisJSONValue].self, forKey: .quantization)
+        speakerPrefixSpace = try container.decodeIfPresent(Bool.self, forKey: .speakerPrefixSpace) ?? false
+
+        attentionBias = try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
+        attentionDropout = try container.decodeIfPresent(Double.self, forKey: .attentionDropout) ?? 0.0
+        audioEosTokenId = try container.decodeIfPresent(Int.self, forKey: .audioEosTokenId) ?? 0
+        audioTokenId = try container.decodeIfPresent(Int.self, forKey: .audioTokenId) ?? 128_002
+        bosTokenId = try container.decodeIfPresent(Int.self, forKey: .bosTokenId) ?? 128_000
+        codebookEosTokenId = try container.decodeIfPresent(Int.self, forKey: .codebookEosTokenId) ?? 0
+        codebookPadTokenId = try container.decodeIfPresent(Int.self, forKey: .codebookPadTokenId) ?? max(0, audioVocabSize - 1)
+        headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) ?? 128
+        hiddenAct = try container.decodeIfPresent(String.self, forKey: .hiddenAct) ?? "silu"
+        hiddenSize = try container.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 4_096
+        initializerRange = try container.decodeIfPresent(Double.self, forKey: .initializerRange) ?? 0.02
+        intermediateSize = try container.decodeIfPresent(Int.self, forKey: .intermediateSize) ?? 14_336
+        maxPositionEmbeddings = try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 2_048
+        mlpBias = try container.decodeIfPresent(Bool.self, forKey: .mlpBias) ?? false
+        numAttentionHeads = try container.decodeIfPresent(Int.self, forKey: .numAttentionHeads) ?? 32
+        numCodebooks = try container.decodeIfPresent(Int.self, forKey: .numCodebooks) ?? audioNumCodebooks
+        numHiddenLayers = try container.decodeIfPresent(Int.self, forKey: .numHiddenLayers) ?? 32
+        numKeyValueHeads = try container.decodeIfPresent(Int.self, forKey: .numKeyValueHeads) ?? 8
+        padTokenId = try container.decodeIfPresent(Int.self, forKey: .padTokenId) ?? audioTokenId
+        rmsNormEps = try container.decodeIfPresent(Double.self, forKey: .rmsNormEps) ?? 1e-5
+        ropeScaling = try container.decodeIfPresent([String: MarvisJSONValue].self, forKey: .ropeScaling)
+        ropeTheta = try container.decodeIfPresent(Int.self, forKey: .ropeTheta) ?? 500_000
+        tieCodebooksEmbeddings = try container.decodeIfPresent(Bool.self, forKey: .tieCodebooksEmbeddings) ?? true
+        tieWordEmbeddings = try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        useCache = try container.decodeIfPresent(Bool.self, forKey: .useCache) ?? true
+        vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? audioVocabSize
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -274,6 +318,7 @@ public struct CSMModelArgs: Codable, Sendable {
         case useCache = "use_cache"
         case vocabSize = "vocab_size"
         case quantization
+        case speakerPrefixSpace = "speaker_prefix_space"
     }
 }
 
@@ -343,8 +388,54 @@ public func createLlamaConfigurationForDecoder(_ d: DepthDecoderConfig) -> CSMLl
     )
 }
 
+private let llama3RopeScaling: [String: StringOrNumber] = [
+    "factor": .float(32.0),
+    "low_freq_factor": .float(1.0),
+    "high_freq_factor": .float(4.0),
+    "original_max_position_embeddings": .float(8_192.0),
+    "rope_type": .string("llama3"),
+]
+
 public func createLlamaConfiguration(flavor: String) throws -> CSMLlamaConfiguration {
     switch flavor {
+    case "llama-8B":
+        return CSMLlamaConfiguration(
+            hiddenSize: 4_096,
+            hiddenLayers: 32,
+            intermediateSize: 14_336,
+            attentionHeads: 32,
+            headDimensions: 128,
+            rmsNormEps: 1e-5,
+            vocabularySize: 128_256,
+            kvHeads: 8,
+            maxPositionEmbeddings: 2_048,
+            ropeTheta: 500_000,
+            ropeTraditional: false,
+            ropeScaling: llama3RopeScaling,
+            tieWordEmbeddings: true,
+            attentionBias: false,
+            mlpBias: false
+        )
+
+    case "llama-300M":
+        return CSMLlamaConfiguration(
+            hiddenSize: 1_536,
+            hiddenLayers: 8,
+            intermediateSize: 6_912,
+            attentionHeads: 24,
+            headDimensions: 64,
+            rmsNormEps: 1e-5,
+            vocabularySize: 128_256,
+            kvHeads: 6,
+            maxPositionEmbeddings: 2_048,
+            ropeTheta: 500_000,
+            ropeTraditional: false,
+            ropeScaling: llama3RopeScaling,
+            tieWordEmbeddings: true,
+            attentionBias: false,
+            mlpBias: false
+        )
+
     case "llama-1B":
         return CSMLlamaConfiguration(
             hiddenSize: 2048,
