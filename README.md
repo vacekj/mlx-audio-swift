@@ -1,3 +1,5 @@
+> **Fork notice.** This is a fork of [Blaizzy/mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift) that integrates newer TTS models ahead of upstream. It currently adds **Higgs Audio v3 TTS** (`bosonai/higgs-tts-3-4b`) — a Qwen3-backed, multi-codebook conversational TTS with a bundled acoustic decoder. See [`Sources/MLXAudioTTS/Models/HiggsAudio/`](Sources/MLXAudioTTS/Models/HiggsAudio). The `readwithmlx-swift61` branch is the active one.
+
 <a href="https://trendshift.io/repositories/20684" target="_blank"><img src="https://trendshift.io/api/badge/repositories/20684" alt="Blaizzy%2Fmlx-audio-swift | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
 # MLX Audio Swift
