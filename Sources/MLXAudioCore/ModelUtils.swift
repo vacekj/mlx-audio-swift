@@ -73,43 +73,6 @@ public enum ModelUtils {
             ? String(requiredExtension.dropFirst())
             : requiredExtension
 
-        // Store downloaded model snapshots under the configured Hugging Face cache root.
-        let modelSubdir = repoID.description.replacingOccurrences(of: "/", with: "_")
-        let modelDir = cache.cacheDirectory
-            .appendingPathComponent("mlx-audio")
-            .appendingPathComponent(modelSubdir)
-
-        // Check if model already exists with required files
-        if FileManager.default.fileExists(atPath: modelDir.path) {
-            let files = try? FileManager.default.contentsOfDirectory(at: modelDir, includingPropertiesForKeys: [.fileSizeKey])
-            let hasRequiredFile = files?.contains { file in
-                guard file.pathExtension == normalizedRequiredExtension else { return false }
-                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-                return size > 0
-            } ?? false
-
-            if hasRequiredFile {
-                // Validate that config.json is valid JSON
-                let configPath = modelDir.appendingPathComponent("config.json")
-                if FileManager.default.fileExists(atPath: configPath.path) {
-                    if let configData = try? Data(contentsOf: configPath),
-                       let _ = try? JSONSerialization.jsonObject(with: configData) {
-                        print("Using cached model at: \(modelDir.path)")
-                        return modelDir
-                    } else {
-                        print("Cached config.json is invalid, clearing cache...")
-                        Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
-                    }
-                }
-            } else {
-                print("Cached model appears incomplete, clearing cache...")
-                Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
-            }
-        }
-
-        // Create directory if needed
-        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
-
         var allowedExtensions: Set<String> = [
             "*.\(normalizedRequiredExtension)",
             "*.safetensors",
@@ -119,11 +82,25 @@ public enum ModelUtils {
         ]
         allowedExtensions.formUnion(additionalMatchingPatterns)
 
+        // Fast path: resolve from the local HF hub cache with filesystem checks
+        // only. downloadSnapshot otherwise resolves the "main" revision over the
+        // network on every call, which stalls the load when offline or slow.
+        if let local = locallyCachedSnapshot(
+            repoID: repoID, cache: cache, requiredExtension: normalizedRequiredExtension
+        ) {
+            print("Model loaded from cache snapshot: \(local.path)")
+            return local
+        }
+
+        // Download into the standard Hugging Face hub cache
+        // (models--<org>--<model>/snapshots/<commit>/) and load directly from
+        // the snapshot directory — no separate flat copy under mlx-audio/. This
+        // keeps a single on-disk copy and matches the Python HF cache layout, so
+        // the app's cache management (sizes/delete) sees the real model.
         print("Downloading model \(repoID)...")
-        _ = try await client.downloadSnapshot(
+        let snapshotDir = try await client.downloadSnapshot(
             of: repoID,
             kind: .model,
-            to: modelDir,
             revision: "main",
             matching: Array(allowedExtensions),
             progressHandler: progressHandler ?? { progress in
@@ -131,32 +108,62 @@ public enum ModelUtils {
             }
         )
 
-        // Post-download validation: ensure required files are non-zero
-        let downloadedFiles = try? FileManager.default.contentsOfDirectory(
-            at: modelDir, includingPropertiesForKeys: [.fileSizeKey]
+        // Validate the required file is present and non-zero. Snapshot entries
+        // are symlinks into blobs/; URL.resourceValues follows them for the size.
+        let files = try? FileManager.default.contentsOfDirectory(
+            at: snapshotDir, includingPropertiesForKeys: [.fileSizeKey]
         )
-        let hasValidFile = downloadedFiles?.contains { file in
+        let hasValidFile = files?.contains { file in
             guard file.pathExtension == normalizedRequiredExtension else { return false }
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
             return size > 0
         } ?? false
 
         if !hasValidFile {
-            Self.clearCaches(modelDir: modelDir, repoID: repoID, hubCache: cache)
+            clearHubCache(repoID: repoID, cache: cache)
             throw ModelUtilsError.incompleteDownload(repoID.description)
         }
 
-        print("Model downloaded to: \(modelDir.path)")
-        return modelDir
+        print("Model loaded from cache snapshot: \(snapshotDir.path)")
+        return snapshotDir
     }
 
-    private static func clearCaches(modelDir: URL, repoID: Repo.ID, hubCache: HubCache) {
-        try? FileManager.default.removeItem(at: modelDir)
-        let hubRepoDir = hubCache.repoDirectory(repo: repoID, kind: .model)
+    /// Remove a repo's entry from the standard Hugging Face hub cache.
+    private static func clearHubCache(repoID: Repo.ID, cache: HubCache) {
+        let hubRepoDir = cache.repoDirectory(repo: repoID, kind: .model)
         if FileManager.default.fileExists(atPath: hubRepoDir.path) {
             print("Clearing Hub cache at: \(hubRepoDir.path)")
             try? FileManager.default.removeItem(at: hubRepoDir)
         }
+    }
+
+    /// Find a complete model snapshot in the standard HF hub cache
+    /// (`models--<org>--<model>/snapshots/<commit>/`) using filesystem checks
+    /// only — no network. Returns the snapshot dir if it has a non-zero file
+    /// with ``requiredExtension`` and a config.json, else nil.
+    private static func locallyCachedSnapshot(
+        repoID: Repo.ID, cache: HubCache, requiredExtension: String
+    ) -> URL? {
+        let snapshotsDir = cache.repoDirectory(repo: repoID, kind: .model)
+            .appendingPathComponent("snapshots")
+        guard let snapshots = try? FileManager.default.contentsOfDirectory(
+            at: snapshotsDir, includingPropertiesForKeys: [.fileSizeKey]
+        ) else { return nil }
+        for snapshot in snapshots {
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: snapshot, includingPropertiesForKeys: [.fileSizeKey]
+            ) else { continue }
+            let hasRequired = files.contains { file in
+                guard file.pathExtension == requiredExtension else { return false }
+                let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                return size > 0
+            }
+            let hasConfig = files.contains { $0.lastPathComponent == "config.json" }
+            if hasRequired && hasConfig {
+                return snapshot
+            }
+        }
+        return nil
     }
 }
 
