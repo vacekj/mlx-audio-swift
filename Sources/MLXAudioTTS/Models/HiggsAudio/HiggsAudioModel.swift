@@ -158,10 +158,17 @@ final class HiggsBackbone: Module {
 // MARK: - Model
 
 public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Sendable {
-    /// RNG seed for Higgs generation. Set per request so the zero-shot voice
-    /// stays consistent across chunks of one reading, while letting the app
-    /// pick/randomize/save a specific voice timbre (see ``generateSamples``).
+    /// RNG seed for Higgs generation. Makes the *same* text reproducible; it
+    /// does **not** by itself keep zero-shot timbre stable across different
+    /// chunks (each chunk still invents a speaker). Pair with
+    /// ``contextReferences`` for long-form consistency.
     public var generationSeed: UInt64 = 42
+
+    /// Extra reference turns prepended after the primary ``refAudio`` (if any).
+    /// Use the first generated chunk (waveform + its transcript) so later
+    /// chunks clone that voice — Boson's recommended long-form pattern.
+    /// Cleared by the caller between unrelated generations.
+    public var contextReferences: [(audio: MLXArray, text: String?)] = []
 
     let configuration: HiggsAudioConfig
 
@@ -366,14 +373,16 @@ public final class HiggsAudioModel: Module, SpeechGenerationModel, @unchecked Se
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
         }
 
-        // Fix the RNG seed per chunk so every chunk of a generation draws from
-        // the same random state — otherwise zero-shot Higgs drifts to a
-        // different voice/timbre between chunks. Same text+seed is reproducible.
+        // Same seed ⇒ same text is reproducible. Different chunk text still
+        // diverges unless ``contextReferences`` (prior audio) anchors the voice.
         MLXRandom.seed(generationSeed)
 
         var references: [HiggsReference] = []
         if let refAudio {
             references.append(HiggsReference(delayedCodes: encodeReference(refAudio), text: refText))
+        }
+        for ctx in contextReferences {
+            references.append(HiggsReference(delayedCodes: encodeReference(ctx.audio), text: ctx.text))
         }
         let promptEmbeds = buildPromptEmbeddings(text: text, references: references)
         eval(promptEmbeds)

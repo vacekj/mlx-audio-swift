@@ -14,6 +14,7 @@ public final class KokoroMultilingualProcessor: TextProcessor, @unchecked Sendab
     private let neuralG2PRepo: String
     private var lexiconCache: [String: [String: String]] = [:]
     private var lexiconDirectory: URL?
+    private var neuralG2PDirectory: URL?
     private var neuralG2P: G2P?
     private let lock = NSLock()
 
@@ -106,7 +107,7 @@ public final class KokoroMultilingualProcessor: TextProcessor, @unchecked Sendab
             throw LexiconError.unsupportedLanguage(lang)
         }
 
-        let dir = lock.withLock { lexiconDirectory } ?? repoDirectory(for: lexiconRepo)
+        let dir = lock.withLock { lexiconDirectory } ?? legacyRepoDirectory(for: lexiconRepo)
         let tsvURL = dir.appendingPathComponent(filename)
 
         guard FileManager.default.fileExists(atPath: tsvURL.path) else {
@@ -132,11 +133,41 @@ public final class KokoroMultilingualProcessor: TextProcessor, @unchecked Sendab
         return dict
     }
 
-    private func repoDirectory(for repo: String) -> URL {
+    /// Flat layout used before these support repos moved into the standard
+    /// Hugging Face cache. Still read so existing installs don't re-download,
+    /// never written to — a directory outside `models--*` is invisible to the
+    /// app's storage accounting and can never be reclaimed.
+    private func legacyRepoDirectory(for repo: String) -> URL {
         let modelSubdir = repo.replacingOccurrences(of: "/", with: "_")
         return HubCache.default.cacheDirectory
             .appendingPathComponent("mlx-audio")
             .appendingPathComponent(modelSubdir)
+    }
+
+    /// Downloads `repo` into the hub cache if needed and returns the directory
+    /// its files live in, preferring an existing legacy copy.
+    private func ensureDownloaded(repo: String, matching globs: [String]) async throws -> URL {
+        let legacy = legacyRepoDirectory(for: repo)
+        if legacyDirectoryHasContent(legacy, matching: globs) {
+            return legacy
+        }
+        guard let repoID = Repo.ID(rawValue: repo) else {
+            throw LexiconError.invalidRepo(repo)
+        }
+        return try await HubClient(cache: .default).downloadSnapshot(
+            of: repoID,
+            kind: .model,
+            matching: globs
+        )
+    }
+
+    private func legacyDirectoryHasContent(_ dir: URL, matching globs: [String]) -> Bool {
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return false
+        }
+        return files.contains { file in
+            globs.contains { fnmatch($0, file, 0) == 0 }
+        }
     }
 
     public func prepare(for language: String) async throws {
@@ -159,49 +190,19 @@ public final class KokoroMultilingualProcessor: TextProcessor, @unchecked Sendab
     }
 
     private func ensureLexiconDownloaded(filename: String) async throws {
-        let dir = repoDirectory(for: lexiconRepo)
-        let fileURL = dir.appendingPathComponent(filename)
-
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            lock.withLock { lexiconDirectory = dir }
+        if let dir = lock.withLock({ lexiconDirectory }),
+           FileManager.default.fileExists(atPath: dir.appendingPathComponent(filename).path)
+        {
             return
         }
-
-        guard let repoID = Repo.ID(rawValue: lexiconRepo) else {
-            throw LexiconError.invalidRepo(lexiconRepo)
-        }
-
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        _ = try await HubClient().downloadSnapshot(
-            of: repoID,
-            kind: .model,
-            to: dir,
-            matching: [filename]
-        )
-
+        let dir = try await ensureDownloaded(repo: lexiconRepo, matching: [filename])
         lock.withLock { lexiconDirectory = dir }
     }
 
     private func ensureNeuralModelDownloaded() async throws {
-        let dir = repoDirectory(for: neuralG2PRepo)
-        let hasSafetensors = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
-            .contains { $0.pathExtension == "safetensors" } ?? false
-
-        if hasSafetensors { return }
-
-        guard let repoID = Repo.ID(rawValue: neuralG2PRepo) else {
-            throw LexiconError.invalidRepo(neuralG2PRepo)
-        }
-
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        _ = try await HubClient().downloadSnapshot(
-            of: repoID,
-            kind: .model,
-            to: dir,
-            matching: ["*.safetensors", "*.json"]
-        )
+        if lock.withLock({ neuralG2PDirectory }) != nil { return }
+        let dir = try await ensureDownloaded(repo: neuralG2PRepo, matching: ["*.safetensors", "*.json"])
+        lock.withLock { neuralG2PDirectory = dir }
     }
 
     // MARK: - Phonemization
@@ -244,9 +245,9 @@ public final class KokoroMultilingualProcessor: TextProcessor, @unchecked Sendab
         }
         lock.unlock()
 
-        let modelDir = repoDirectory(for: neuralG2PRepo)
-
-        guard FileManager.default.fileExists(atPath: modelDir.path) else {
+        guard let modelDir = lock.withLock({ neuralG2PDirectory }),
+              FileManager.default.fileExists(atPath: modelDir.path)
+        else {
             throw LexiconError.neuralModelNotDownloaded(neuralG2PRepo)
         }
 

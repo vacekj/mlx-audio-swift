@@ -280,6 +280,32 @@ private func marvisModelFolderHasTokenizer(_ directory: URL) -> Bool {
     }
 }
 
+private let marvisTokenizerRepo = "meta-llama/Llama-3.2-1B"
+
+/// Hub client for the out-of-band tokenizer fetch.
+///
+/// `HubApi`'s default `downloadBase` is `~/Documents/huggingface` — it drops
+/// model files into the user's Documents folder (often iCloud-synced), where
+/// the app's storage management can neither see nor reclaim them. Keep them
+/// alongside every other model, under the Hugging Face cache root.
+private let marvisTokenizerHub = HubApi(
+    downloadBase: ModelUtils.hubCacheDirectory.appendingPathComponent("mlx-audio-tokenizers")
+)
+
+private enum MarvisTokenizerError: LocalizedError {
+    case gatedTokenizerUnavailable(repo: String, underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .gatedTokenizerUnavailable(let repo, let underlying):
+            return "Couldn't load the tokenizer this model needs from '\(repo)'. "
+                + "That repository is license-gated on Hugging Face: accept its license, "
+                + "then sign in (`huggingface-cli login`) or set HF_TOKEN. "
+                + "(\(underlying.localizedDescription))"
+        }
+    }
+}
+
 private func marvisResolveTextTokenizer(
     modelDirectoryURL: URL,
     args: CSMModelArgs,
@@ -291,7 +317,17 @@ private func marvisResolveTextTokenizer(
 
     if args.modelType == "sesame" || modelRepo.localizedCaseInsensitiveContains("miso") {
         // Miso TTS uses the Llama 3.2 tokenizer but does not ship tokenizer files in the MLX repo.
-        return try await AutoTokenizer.from(pretrained: "meta-llama/Llama-3.2-1B")
+        do {
+            return try await AutoTokenizer.from(
+                pretrained: marvisTokenizerRepo,
+                hubApi: marvisTokenizerHub
+            )
+        } catch {
+            // meta-llama repos are license-gated: without an accepted license
+            // and a token the Hub returns 401/403, which surfaces as an opaque
+            // decoding failure. Say what the user actually has to do.
+            throw MarvisTokenizerError.gatedTokenizerUnavailable(repo: marvisTokenizerRepo, underlying: error)
+        }
     }
 
     return try await AutoTokenizer.from(modelFolder: modelDirectoryURL)

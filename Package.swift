@@ -63,7 +63,15 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm.git", .upToNextMajor(from: "3.31.3")),
         .package(url: "https://github.com/huggingface/swift-transformers.git", .upToNextMajor(from: "1.1.6")),
-        .package(url: "https://github.com/huggingface/swift-huggingface.git", .upToNextMajor(from: "0.8.1"))
+        // Xet is opt-in via an SPM trait. Without it, multi-gigabyte shards go
+        // through a single URLSession download that times out on slow links;
+        // with it, the Hub client fetches chunked CAS objects in parallel and
+        // resumes cleanly.
+        .package(
+            url: "https://github.com/huggingface/swift-huggingface.git",
+            .upToNextMajor(from: "0.8.1"),
+            traits: ["Xet"]
+        )
     ],
     targets: [
         // MARK: - MLXAudioCore

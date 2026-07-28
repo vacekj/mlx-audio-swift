@@ -233,6 +233,61 @@ public final class MimiStreamingDecoder {
 }
 
 public extension Mimi {
+    /// Repo the default Mimi codec weights come from. Exposed so the app can
+    /// account for it in storage management — it is a multi-hundred-megabyte
+    /// download that no model catalog entry names directly.
+    static let defaultRepoId = "kyutai/moshiko-pytorch-bf16"
+    static let defaultWeightsFilename = "tokenizer-e351c8d8-checkpoint125.safetensors"
+
+    /// Legacy flat location used before the codec moved into the standard
+    /// Hugging Face cache layout. Still read (so existing installs don't
+    /// re-download ~1 GB) but never written to.
+    static func legacyWeightsURL(
+        repoId: String = Mimi.defaultRepoId,
+        filename: String = Mimi.defaultWeightsFilename,
+        cache: HubCache = .default
+    ) -> URL {
+        cache.cacheDirectory
+            .appendingPathComponent("mlx-audio")
+            .appendingPathComponent(repoId.replacingOccurrences(of: "/", with: "_"))
+            .appendingPathComponent(filename)
+    }
+
+    /// Resolves the codec weights, downloading into the standard hub cache when
+    /// absent. Keeping this in `models--kyutai--moshiko-pytorch-bf16/` rather
+    /// than a flat side directory is what lets cache size reporting and delete
+    /// see the file at all.
+    private static func resolveWeightsFile(
+        repoID: Repo.ID,
+        filename: String,
+        cache: HubCache,
+        progressHandler: @Sendable @escaping (Progress) -> Void
+    ) async throws -> URL {
+        let legacy = legacyWeightsURL(repoId: repoID.description, filename: filename, cache: cache)
+        if FileManager.default.fileExists(atPath: legacy.path) {
+            return legacy
+        }
+
+        let client = HubClient(cache: cache)
+        let snapshotDir = try await client.downloadSnapshot(
+            of: repoID,
+            kind: .model,
+            revision: "main",
+            matching: [filename],
+            progressHandler: progressHandler
+        )
+
+        let weightFileURL = snapshotDir.appendingPathComponent(filename)
+        guard FileManager.default.fileExists(atPath: weightFileURL.path) else {
+            throw NSError(
+                domain: "Mimi",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Expected weights file not found at \(weightFileURL.path)"]
+            )
+        }
+        return weightFileURL
+    }
+
     static func fromPretrained(
         repoId: String = "kyutai/moshiko-pytorch-bf16",
         filename: String = "tokenizer-e351c8d8-checkpoint125.safetensors",
@@ -259,33 +314,12 @@ public extension Mimi {
                 userInfo: [NSLocalizedDescriptionKey: "Invalid repository ID: \(repoId)"]
             )
         }
-        let modelSubdir = repoID.description.replacingOccurrences(of: "/", with: "_")
-        let modelDir = cache.cacheDirectory
-            .appendingPathComponent("mlx-audio")
-            .appendingPathComponent(modelSubdir)
-        let weightFileURL = modelDir.appendingPathComponent(filename)
-
-        if !FileManager.default.fileExists(atPath: weightFileURL.path) {
-            try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
-
-            let client = HubClient(cache: cache)
-            _ = try await client.downloadSnapshot(
-                of: repoID,
-                kind: .model,
-                to: modelDir,
-                revision: "main",
-                matching: [filename],
-                progressHandler: progressHandler
-            )
-        }
-
-        guard FileManager.default.fileExists(atPath: weightFileURL.path) else {
-            throw NSError(
-                domain: "Mimi",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Expected weights file not found at \(weightFileURL.path)"]
-            )
-        }
+        let weightFileURL = try await resolveWeightsFile(
+            repoID: repoID,
+            filename: filename,
+            cache: cache,
+            progressHandler: progressHandler
+        )
         let snapshotTime = CFAbsoluteTimeGetCurrent() - snapshotStart
         print(String(format: "[Mimi] Weights file snapshot completed in %.2f seconds", snapshotTime))
 
